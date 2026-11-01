@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.SearchManager
 import android.app.Service
 import android.content.BroadcastReceiver
@@ -20,15 +21,20 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.provider.AlarmClock
 import android.provider.CallLog
 import android.provider.ContactsContract
 import android.provider.MediaStore
 import android.provider.ContactsContract.CommonDataKinds.Phone
 import android.provider.Settings
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
+import java.io.IOException
+import org.json.JSONObject
+import org.vosk.Model
+import org.vosk.Recognizer
+import org.vosk.android.SpeechService
+import org.vosk.android.StorageService
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.telecom.TelecomManager
@@ -41,10 +47,9 @@ import java.util.Date
 import java.util.Locale
 
 @Suppress("DEPRECATION")
-class AssistantService : Service(), RecognitionListener, TextToSpeech.OnInitListener {
+class AssistantService : Service(), TextToSpeech.OnInitListener {
     private val handler = Handler(Looper.getMainLooper())
     private val starter = Runnable { startListening() }
-    private var rec: SpeechRecognizer? = null
     private var tts: TextToSpeech? = null
     private var speaking = false
     private var running = true
@@ -55,11 +60,45 @@ class AssistantService : Service(), RecognitionListener, TextToSpeech.OnInitList
     }
 
     fun say(text: String) {
-        handler.post { rec?.cancel(); handler.removeCallbacks(starter); speak(text) }
+        handler.post { stopEngine(); handler.removeCallbacks(starter); speak(text) }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int) = START_STICKY
+    private var alwaysOn = true    // wake-word mode (on by default)
+    private var oneShot = false    // listening because the user pressed Talk
+    private var inCall = false
+
+    private fun buildNotif(): Notification {
+        fun pi(a: String) = PendingIntent.getService(this, a.hashCode(),
+            Intent(this, AssistantService::class.java).setAction(a),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        return Notification.Builder(this, "jarvis")
+            .setContentTitle(if (alwaysOn) "Friday is always listening" else "Friday is ready")
+            .setContentText(if (alwaysOn) "Say \"Friday\" then a command" else "Tap Talk to give a command")
+            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .addAction(Notification.Action.Builder(0, "Talk", pi("LISTEN")).build())
+            .addAction(Notification.Action.Builder(0, if (alwaysOn) "Wake word: OFF" else "Wake word: ON", pi("TOGGLE_ALWAYS")).build())
+            .build()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            "LISTEN" -> {
+                if (model == null) { say("Still loading the speech model"); return START_STICKY }
+                oneShot = true
+                tts?.stop(); speaking = false
+                try { getSystemService(Vibrator::class.java)?.vibrate(VibrationEffect.createOneShot(80, VibrationEffect.DEFAULT_AMPLITUDE)) } catch (e: Exception) {}
+                stopEngine()
+                restart(150)
+            }
+            "TOGGLE_ALWAYS" -> {
+                alwaysOn = !alwaysOn
+                getSystemService(NotificationManager::class.java).notify(1, buildNotif())
+                if (alwaysOn) { say("Wake word mode on"); } else { stopEngine(); muteBeep(false); say("Wake word mode off") }
+            }
+        }
+        return START_STICKY
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -67,16 +106,13 @@ class AssistantService : Service(), RecognitionListener, TextToSpeech.OnInitList
         try {
             val nm = getSystemService(NotificationManager::class.java)
             nm.createNotificationChannel(NotificationChannel("jarvis", "Jarvis", NotificationManager.IMPORTANCE_LOW))
-            val n = Notification.Builder(this, "jarvis")
-                .setContentTitle("Friday is listening")
-                .setContentText("Say \"Friday\" then a command")
-                .setSmallIcon(android.R.drawable.ic_btn_speak_now).build()
+            val n = buildNotif()
             if (Build.VERSION.SDK_INT >= 29)
                 startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
             else startForeground(1, n)
         } catch (e: Exception) { stopSelf(); return }
         tts = TextToSpeech(this, this)
-        rec = SpeechRecognizer.createSpeechRecognizer(this).also { it.setRecognitionListener(this) }
+        loadModel()
         try {
             val f = IntentFilter(TelephonyManager.ACTION_PHONE_STATE_CHANGED)
             if (Build.VERSION.SDK_INT >= 33) registerReceiver(callReceiver, f, Context.RECEIVER_EXPORTED)
@@ -98,6 +134,7 @@ class AssistantService : Service(), RecognitionListener, TextToSpeech.OnInitList
 
     private fun speak(text: String) {
         speaking = true
+        stopEngine()
         tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "u")
     }
 
@@ -106,41 +143,68 @@ class AssistantService : Service(), RecognitionListener, TextToSpeech.OnInitList
         handler.postDelayed(starter, ms)
     }
 
-    private fun startListening() {
-        if (!running || speaking) return
-        val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
-            .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            .putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
-        try { rec?.startListening(i) } catch (e: Exception) { restart(1500) }
+    private fun muteBeep(on: Boolean) {}   // not needed: our own engine makes no beeps
+
+    private fun buzz() {
+        try { getSystemService(Vibrator::class.java)?.vibrate(VibrationEffect.createOneShot(80, VibrationEffect.DEFAULT_AMPLITUDE)) } catch (e: Exception) {}
     }
 
-    // ---- RecognitionListener ----
-    override fun onResults(results: Bundle?) {
-        val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-            ?.firstOrNull()?.lowercase() ?: ""
+    // ---- our own offline speech engine (Vosk): no beeps, no audio focus, never pauses your music ----
+    private var model: Model? = null
+    private var svc: SpeechService? = null
+    private var cmdMode = false
+
+    private fun loadModel() {
+        StorageService.unpack(this, "model-en", "model",
+            StorageService.Callback<Model> { m -> model = m; restart(200) },
+            StorageService.Callback<IOException> { say("The speech model failed to load") })
+    }
+
+    private fun stopEngine() {
+        try { svc?.stop(); svc?.shutdown() } catch (e: Exception) {}
+        svc = null
+    }
+
+    private fun startListening() {
+        if (!running || speaking || (inCall && !oneShot)) return
+        if (!alwaysOn && !oneShot && !ringing) { stopEngine(); return }
+        if (svc != null) return
+        val m = model ?: return
+        try {
+            val s = SpeechService(Recognizer(m, 16000.0f), 16000.0f)
+            svc = s
+            if (cmdMode || oneShot) s.startListening(vosk, 8000) else s.startListening(vosk)
+        } catch (e: Exception) { svc = null; restart(3000) }
+    }
+
+    private val vosk = object : org.vosk.android.RecognitionListener {
+        override fun onPartialResult(h: String?) {}
+        override fun onResult(h: String?) { onVoice(h) }
+        override fun onFinalResult(h: String?) { onVoice(h) }
+        override fun onError(e: Exception?) { stopEngine(); restart(3000) }
+        override fun onTimeout() { cmdMode = false; oneShot = false; stopEngine(); restart(200) }
+    }
+
+    private fun onVoice(json: String?) {
+        val text = try { JSONObject(json ?: "").optString("text") } catch (e: Exception) { "" }.lowercase().trim()
+        if (text.isEmpty()) return
         if (ringing && Regex("answer|pick|accept|reject|decline|cut|hang").containsMatchIn(text)) {
-            ringing = false
+            ringing = false; stopEngine()
             if (Regex("reject|decline|cut|hang").containsMatchIn(text)) endCall() else answer()
             restart(300); return
         }
-        val w = listOf("friday", "fry day").firstOrNull { it in text }
-        if (w != null) {
-            try { handle(text.substringAfter(w).trim()) }
-            catch (e: Exception) { speak("Sorry, that did not work") }
+        val i = text.indexOf("friday")
+        val cmd = when {
+            cmdMode || oneShot -> if (i >= 0) text.substring(i + 6).trim() else text
+            i >= 0 -> text.substring(i + 6).trim()
+            else -> return
         }
+        stopEngine()
+        if (cmd.isEmpty()) { cmdMode = true; buzz(); restart(100); return }   // heard only "friday"
+        cmdMode = false; oneShot = false
+        try { handle(cmd) } catch (e: Exception) { speak("Sorry, that did not work") }
         if (!speaking) restart(300)
     }
-    override fun onError(error: Int) {
-        rec?.cancel()
-        restart(if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) 1500 else 400)
-    }
-    override fun onReadyForSpeech(p: Bundle?) {}
-    override fun onBeginningOfSpeech() {}
-    override fun onRmsChanged(v: Float) {}
-    override fun onBufferReceived(b: ByteArray?) {}
-    override fun onEndOfSpeech() {}
-    override fun onPartialResults(p: Bundle?) {}
-    override fun onEvent(t: Int, p: Bundle?) {}
 
     // ---- commands ----
     private fun go(i: Intent) { startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
@@ -360,7 +424,11 @@ class AssistantService : Service(), RecognitionListener, TextToSpeech.OnInitList
                 ringing = true; ringNum = num
                 val who = if (num != null) nameFor(num) else "an unknown number"
                 say("Incoming call from $who. Say answer or reject.")
-            } else { ringing = false; ringNum = null }
+            } else {
+                ringing = false; ringNum = null
+                if (st == TelephonyManager.EXTRA_STATE_OFFHOOK) { inCall = true; stopEngine(); muteBeep(false) }
+                else { inCall = false; if (alwaysOn) restart(1000) else stopEngine() }
+            }
         }
     }
 
@@ -463,8 +531,10 @@ class AssistantService : Service(), RecognitionListener, TextToSpeech.OnInitList
         running = false
         instance = null
         try { unregisterReceiver(callReceiver) } catch (e: Exception) {}
+        muteBeep(false)
         handler.removeCallbacksAndMessages(null)
-        rec?.destroy()
+        stopEngine()
+        model?.close()
         tts?.shutdown()
         super.onDestroy()
     }

@@ -43,6 +43,12 @@ class MainActivity : Activity() {
         btn("4. Start assistant") {
             startForegroundService(Intent(this, AssistantService::class.java))
         }
+        btn("Talk now") {
+            startService(Intent(this, AssistantService::class.java).setAction("LISTEN"))
+        }
+        btn("Wake word mode on/off") {
+            startService(Intent(this, AssistantService::class.java).setAction("TOGGLE_ALWAYS"))
+        }
         btn("Stop assistant") {
             stopService(Intent(this, AssistantService::class.java))
         }
