@@ -30,7 +30,10 @@ import android.provider.MediaStore
 import android.provider.ContactsContract.CommonDataKinds.Phone
 import android.provider.Settings
 import java.io.IOException
+import org.json.JSONArray
 import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
 import org.vosk.Model
 import org.vosk.Recognizer
 import org.vosk.android.SpeechService
@@ -56,6 +59,7 @@ class AssistantService : Service(), TextToSpeech.OnInitListener {
 
     companion object {
         var instance: AssistantService? = null
+        @Volatile var status = "Service not started"
         @Volatile var announce = false
     }
 
@@ -91,6 +95,14 @@ class AssistantService : Service(), TextToSpeech.OnInitListener {
                 stopEngine()
                 restart(150)
             }
+            "ASK" -> {
+                val q = intent?.getStringExtra("q") ?: ""
+                if (q.isNotBlank()) {
+                    Chat.add(true, q)
+                    try { handle(q.lowercase().trim()) } catch (e: Exception) { speak("Sorry, that did not work") }
+                }
+            }
+            "ASSIST" -> openAssistant()
             "TOGGLE_ALWAYS" -> {
                 alwaysOn = !alwaysOn
                 getSystemService(NotificationManager::class.java).notify(1, buildNotif())
@@ -110,7 +122,7 @@ class AssistantService : Service(), TextToSpeech.OnInitListener {
             if (Build.VERSION.SDK_INT >= 29)
                 startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
             else startForeground(1, n)
-        } catch (e: Exception) { stopSelf(); return }
+        } catch (e: Exception) { status = "Service failed to start: ${e.message}"; stopSelf(); return }
         tts = TextToSpeech(this, this)
         loadModel()
         try {
@@ -132,7 +144,8 @@ class AssistantService : Service(), TextToSpeech.OnInitListener {
         speak("Friday is ready")
     }
 
-    private fun speak(text: String) {
+    private fun speak(text: String, log: Boolean = true) {
+        if (log) Chat.add(false, text)
         speaking = true
         stopEngine()
         tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "u")
@@ -145,6 +158,72 @@ class AssistantService : Service(), TextToSpeech.OnInitListener {
 
     private fun muteBeep(on: Boolean) {}   // not needed: our own engine makes no beeps
 
+    private var pauseUntil = 0L
+    private val history = ArrayList<Pair<String, String>>()
+
+    private fun showUi() {
+        try { go(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or Intent.FLAG_ACTIVITY_SINGLE_TOP)) } catch (e: Exception) {}
+    }
+
+    // Sends the question to Google's Gemini and shows + speaks the answer in Friday's own UI
+    private fun askGemini(q: String) {
+        val key = getSharedPreferences("cfg", MODE_PRIVATE).getString("key", "") ?: ""
+        if (key.isEmpty()) {
+            Chat.add(false, "Tip: add your Gemini API key in the menu (gear icon) to get answers here.")
+            openAssistant(); return
+        }
+        status = "Thinking..."
+        history.add(Pair("user", q))
+        val turns = history.takeLast(8).toList()
+        Thread {
+            val reply = try { callGemini(key, turns) } catch (e: Exception) { "I could not reach Gemini. Check your internet connection." }
+            handler.post {
+                if (!reply.startsWith("Gemini error") && !reply.startsWith("I could not")) history.add(Pair("model", reply))
+                status = "Listening for \"Friday\"..."
+                Chat.add(false, reply)
+                speak(reply.replace("*", "").replace("#", "").take(1200), false)
+            }
+        }.start()
+    }
+
+    private fun callGemini(key: String, turns: List<Pair<String, String>>): String {
+        val contents = JSONArray()
+        for ((r, t) in turns) contents.put(JSONObject().put("role", r)
+            .put("parts", JSONArray().put(JSONObject().put("text", t))))
+        val sys = "You are Friday, a friendly voice assistant. Answer in one to three short sentences unless asked for more. No markdown."
+        val body = JSONObject().put("contents", contents)
+            .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", sys))))
+        val c = URL("https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent")
+            .openConnection() as HttpURLConnection
+        c.requestMethod = "POST"; c.connectTimeout = 15000; c.readTimeout = 30000; c.doOutput = true
+        c.setRequestProperty("Content-Type", "application/json")
+        c.setRequestProperty("x-goog-api-key", key)
+        c.outputStream.use { it.write(body.toString().toByteArray()) }
+        val ok = c.responseCode in 200..299
+        val txt = (if (ok) c.inputStream else c.errorStream).bufferedReader().readText()
+        if (!ok) {
+            val m = try { JSONObject(txt).getJSONObject("error").getString("message") } catch (e: Exception) { txt.take(150) }
+            return "Gemini error ${c.responseCode}: $m"
+        }
+        return JSONObject(txt).getJSONArray("candidates").getJSONObject(0)
+            .getJSONObject("content").getJSONArray("parts").getJSONObject(0).getString("text").trim()
+    }
+
+    // Hand over to the phone's default assistant (Google Assistant or Gemini) and stay quiet so it can use the mic
+    private fun openAssistant() {
+        status = "Opening your phone's assistant..."
+        buzz()
+        for (i in listOf(Intent(Intent.ACTION_ASSIST), Intent(Intent.ACTION_VOICE_COMMAND))) {
+            try {
+                go(i)
+                pauseUntil = System.currentTimeMillis() + 15000
+                restart(16000)
+                return
+            } catch (e: Exception) {}
+        }
+        speak("I could not open the assistant")
+    }
+
     private fun buzz() {
         try { getSystemService(Vibrator::class.java)?.vibrate(VibrationEffect.createOneShot(80, VibrationEffect.DEFAULT_AMPLITUDE)) } catch (e: Exception) {}
     }
@@ -155,9 +234,10 @@ class AssistantService : Service(), TextToSpeech.OnInitListener {
     private var cmdMode = false
 
     private fun loadModel() {
+        status = "Loading speech model (10-20 seconds)..."
         StorageService.unpack(this, "model-en", "model",
-            StorageService.Callback<Model> { m -> model = m; restart(200) },
-            StorageService.Callback<IOException> { say("The speech model failed to load") })
+            StorageService.Callback<Model> { m -> model = m; status = "Model loaded"; restart(200) },
+            StorageService.Callback<IOException> { e -> status = "MODEL FAILED: ${e?.message}"; say("The speech model failed to load") })
     }
 
     private fun stopEngine() {
@@ -167,6 +247,7 @@ class AssistantService : Service(), TextToSpeech.OnInitListener {
 
     private fun startListening() {
         if (!running || speaking || (inCall && !oneShot)) return
+        if (System.currentTimeMillis() < pauseUntil) { restart(1000); return }
         if (!alwaysOn && !oneShot && !ringing) { stopEngine(); return }
         if (svc != null) return
         val m = model ?: return
@@ -174,20 +255,25 @@ class AssistantService : Service(), TextToSpeech.OnInitListener {
             val s = SpeechService(Recognizer(m, 16000.0f), 16000.0f)
             svc = s
             if (cmdMode || oneShot) s.startListening(vosk, 8000) else s.startListening(vosk)
-        } catch (e: Exception) { svc = null; restart(3000) }
+            status = if (alwaysOn) "Listening for \"Friday\"..." else "Listening for your command..."
+        } catch (e: Exception) { svc = null; status = "MIC ERROR: ${e.message}"; restart(3000) }
     }
 
     private val vosk = object : org.vosk.android.RecognitionListener {
-        override fun onPartialResult(h: String?) {}
+        override fun onPartialResult(h: String?) {
+            val p = try { JSONObject(h ?: "").optString("partial") } catch (e: Exception) { "" }
+            if (p.isNotEmpty()) status = "Hearing: $p"
+        }
         override fun onResult(h: String?) { onVoice(h) }
         override fun onFinalResult(h: String?) { onVoice(h) }
-        override fun onError(e: Exception?) { stopEngine(); restart(3000) }
+        override fun onError(e: Exception?) { status = "ENGINE ERROR: ${e?.message}"; stopEngine(); restart(3000) }
         override fun onTimeout() { cmdMode = false; oneShot = false; stopEngine(); restart(200) }
     }
 
     private fun onVoice(json: String?) {
         val text = try { JSONObject(json ?: "").optString("text") } catch (e: Exception) { "" }.lowercase().trim()
         if (text.isEmpty()) return
+        status = "Heard: $text"
         if (ringing && Regex("answer|pick|accept|reject|decline|cut|hang").containsMatchIn(text)) {
             ringing = false; stopEngine()
             if (Regex("reject|decline|cut|hang").containsMatchIn(text)) endCall() else answer()
@@ -200,8 +286,9 @@ class AssistantService : Service(), TextToSpeech.OnInitListener {
             else -> return
         }
         stopEngine()
-        if (cmd.isEmpty()) { cmdMode = true; buzz(); restart(100); return }   // heard only "friday"
+        if (cmd.isEmpty()) { cmdMode = true; buzz(); showUi(); restart(300); return }   // heard only "friday"
         cmdMode = false; oneShot = false
+        Chat.add(true, cmd)
         try { handle(cmd) } catch (e: Exception) { speak("Sorry, that did not work") }
         if (!speaking) restart(300)
     }
@@ -284,7 +371,7 @@ class AssistantService : Service(), TextToSpeech.OnInitListener {
             "joke" in t -> speak("Why do programmers prefer dark mode? Because light attracts bugs.")
             "help" in t || "what can you do" in t ->
                 speak("I can control music, read your notifications, open apps, make and answer calls, check missed calls, text, set alarms, timers and reminders, take notes, do maths, navigate, tell the weather, flip a coin, and more.")
-            else -> speak("Sorry, I did not understand")
+            else -> askGemini(t)
         }
     }
 
